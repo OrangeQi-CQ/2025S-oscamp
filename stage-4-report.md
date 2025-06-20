@@ -23,22 +23,27 @@
 
 ### 2.1 页缓存架构设计：文件
 
-```mermaid
-flowchart TD
+核心组件介绍。首先介绍 page cache 无关的组件：
+- `starry_api::File`
+- `FD_TABLE`
+- `ramfs/ext4/ramfs::File`
 
-PageCacheManager --> PageCache
+page cache 相关组件：
+- `Page`
+- `PagePool`
+- `PageCache`
+- `PageCacheManager`
+- `VMAManager`
 
-用户空间文件fd或path -.-> |基于fd的调用\n（sys_read,sys_write等）|FD_TABLE
 
-starry_api::File -.-> |每个文件path对应一个PageCache|PageCache
-PageCache --> |多个PageCache共用PagePool|PagePool
-PagePool--> |分配回收、页面置换|Page 
-PageCache --> axfs::File
 
-Page -.-> |加载、写回|axfs::File --> |由vfs对接具体文件系统|fatfs,ext4
 
-FD_TABLE --> |open创建close删除|starry_api::File
-```
+不使用 page cache 的文件相关操作，例如使用 direct 标志 open 文件，或者不经过 page_cache 的系统调用
+![alt text](pic/direct_io.png)
+
+经过 page cache 的系统调用，主要基于 fd，例如 `sys_read`，`sys_write`，`sys_ftruncate`，`sys_stat` 等：
+
+![alt text](pic/page_cache_io.png)
 
 ### 2.2 页缓存架构设计：mmap
 
