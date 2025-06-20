@@ -23,6 +23,23 @@
 
 ### 2.1 页缓存架构设计：文件
 
+```mermaid
+flowchart TD
+
+PageCacheManager --> PageCache
+
+用户空间文件fd或path -.-> |基于fd的调用\n（sys_read,sys_write等）|FD_TABLE
+
+starry_api::File -.-> |每个文件path对应一个PageCache|PageCache
+PageCache --> |多个PageCache共用PagePool|PagePool
+PagePool--> |分配回收、页面置换|Page 
+PageCache --> axfs::File
+
+Page -.-> |加载、写回|axfs::File --> |由vfs对接具体文件系统|fatfs,ext4
+
+FD_TABLE --> |open创建close删除|starry_api::File
+```
+
 ### 2.2 页缓存架构设计：mmap
 
 ### 2.3 延迟加载：lazy-alloc 机制
@@ -83,8 +100,12 @@ Starry-next 页面置换算法（目前的实现较为粗糙）：
 
 ### 2.6 并发安全
 
-### 2.7 测试
-- 文件 io 测试：用于测试页缓存的性能提升。在 ext4 系统中，大规模局部性读取文件，性能将会从文件 io 级别提升至内存读写级别。
+page_cache 接管了所有上层的文件操作，包括文件相关的 `read, write` 以及 mmap 后的内存读写。所以只有在多个进程并发 `open` 文件的时候才会涉及 `axfs` 层的并发。
+
+page_cache 的锁细粒度较小，精细到每个页面。锁精细化的优点是提升并发性能，缺点是容易造成死锁和同步 bug。
+
+### 2.7 测试与性能分析
+- 文件 io 测试 `page_cache.c`：用于测试页缓存的性能提升。在 ext4 系统中，大规模局部性读取文件，性能将会从文件 io 级别提升至内存读写级别。
 
 ![性能比较](pic/io_speed.png)
 
