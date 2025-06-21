@@ -8,9 +8,9 @@
 ### 1.1 核心工作
 
 1. 编写一整完整的 **页缓存** 系统，接入文件和 mmap相关系统调用，pr 正在 review。
-2. 实现一套 **共享内存** 机制，帮助部分同学通过全国大学生 OS 比赛地=的 iozone 测例。
+2. 实现一套 **共享内存** 机制，帮助部分同学通过全国大学生 OS 比赛的 iozone 测例。
 
-以上两项工作都是全新的 feature，合计约 2600+ 行代码
+以上两项工作都是全新的 feature，合计约 2700+ 行代码
 
 ### 1.2 辅助工作
 
@@ -23,27 +23,32 @@
 
 ### 2.1 页缓存架构设计：文件
 
-核心组件介绍。首先介绍 page cache 无关的组件：
-- `starry_api::File`
-- `FD_TABLE`
-- `ramfs/ext4/ramfs::File`
+#### 2.1.1 对打开文件的管理
 
-page cache 相关组件：
-- `Page`
-- `PagePool`
-- `PageCache`
-- `PageCacheManager`
-- `VMAManager`
-
-
-
-
-不使用 page cache 的文件相关操作，例如使用 direct 标志 open 文件，或者不经过 page_cache 的系统调用
+下图表示不使用 PageCache 的文件相关操作，例如使用 direct 标志 open 文件或者不经过 page_cache 的系统调用。
 ![alt text](pic/direct_io.png)
 
-经过 page cache 的系统调用，主要基于 fd，例如 `sys_read`，`sys_write`，`sys_ftruncate`，`sys_stat` 等：
+引入 PageCache 后，相关组件介绍如下：
+- `PageCacheManager`：用来管理所有的 PageCache，核心作用是让重复打开的文件能够对接到同一个 PageCache；
+- `PageCache`：接管对文件的读写相关操作；
+- `PagePool`：所有的 PageCache 共用一个 PagePool，用于限制页缓存系统占用的总内存，并实现页面置换；
+- `Page`：管理页面的加载写回；
 
-![alt text](pic/page_cache_io.png)
+下图表示 PageCache 对文件相关系统调用的接管，例如 `sys_read`，`sys_write`，`sys_ftruncate`，`sys_stat` 等：
+
+![每个文件有各自的 PageCache](pic/page_cache_io.png)
+
+#### 2.1.2 对单个文件的并发 IO 
+
+当不同进程同时打开一个文件，会创造多个 `starry_api::File`，并且可能会得到不同的 `fd`。此时对文件读写有以下要求：
+- 每个进程看到的文件偏移量是独立的，即进程1正在位置 `i` 写入，进程 2 正在位置 `j` 写入，他们的写入位置不能互相干扰；
+- 每个进程对文件的读写要保证一致性，即进程 1 写入的内容能被进程 2 看到；
+
+当不使用 PageCache 直接 io 时，在 `axfs::File` 层维护每个进程看到的文件偏移量，并由具体的文件系统确保读写一致性。架构图如下：
+![alt text](pic/concurrent_direct_io.png)
+
+使用 PageCache 时，在 `starry_api::File` 层维护每个进程看到的文件偏移量，由 PageCache 实现读写一致性。此时所有的并发读写操作全部由 PageCache 接管，从底层 `axfs::File` 的视角只有 `open` 操作涉及到并发。具体架构如下：
+![使用 PageCache 并发打开同一个文件](pic/concurrent_page_cache_io.png)
 
 ### 2.2 页缓存架构设计：mmap
 
