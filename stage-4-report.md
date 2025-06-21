@@ -7,25 +7,29 @@
 
 ### 1.1 核心工作
 
-1. 编写一整完整的 **页缓存** 系统，接入文件和 mmap相关系统调用，pr 正在 review。
-2. 实现一套 **共享内存** 机制，帮助部分同学通过全国大学生 OS 比赛的 iozone 测例。
+1. 编写一整完整的 **页缓存** 系统，接入文件和 mmap相关系统调用，pr 正在 review。[pr 链接](https://github.com/oscomp/starry-next/pull/53
+)
+2. 实现一套 **共享内存** 机制，帮助部分同学通过全国大学生 OS 比赛的 iozone 测例。[仓库链接](https://github.com/OrangeQi-CQ/starry-next/tree/shm_SystemV)
 
 以上两项工作都是全新的 feature，合计约 2700+ 行代码
 
 ### 1.2 辅助工作
 
-1. 修改 arceos，以适配页缓存。
-2. 完善 page_table_multiarch 组件。
+1. 修改 arceos，以适配页缓存。[pr 链接](https://github.com/oscomp/arceos/pull/48
+)
+2. 完善 page_table_multiarch 组件。[pr 链接](https://github.com/Mivik/page_table_multiarch/pull/1
+)
 
 以上两项工作均为补丁性质，没有实现新的模块。
 
 ## 二、页缓存系统
 
-### 2.1 页缓存架构设计：文件
+### 2.1 页缓存架构设计
 
 #### 2.1.1 对打开文件的管理
 
 下图表示不使用 PageCache 的文件相关操作，例如使用 direct 标志 open 文件或者不经过 page_cache 的系统调用。
+
 ![alt text](pic/direct_io.png)
 
 引入 PageCache 后，相关组件介绍如下：
@@ -45,14 +49,41 @@
 - 每个进程对文件的读写要保证一致性，即进程 1 写入的内容能被进程 2 看到；
 
 当不使用 PageCache 直接 io 时，在 `axfs::File` 层维护每个进程看到的文件偏移量，并由具体的文件系统确保读写一致性。架构图如下：
+
 ![alt text](pic/concurrent_direct_io.png)
 
 使用 PageCache 时，在 `starry_api::File` 层维护每个进程看到的文件偏移量，由 PageCache 实现读写一致性。此时所有的并发读写操作全部由 PageCache 接管，从底层 `axfs::File` 的视角只有 `open` 操作涉及到并发。具体架构如下：
+
 ![使用 PageCache 并发打开同一个文件](pic/concurrent_page_cache_io.png)
 
-### 2.2 页缓存架构设计：mmap
+### 2.2 页缓存对 mmap 的接管
+
+根据匿名/文件、私有/共享，主要有 4 种 mmap：
+1. 匿名私有：相当于 malloc
+2. 匿名共享：相当于 Private 的共享内存，只能在父子进程之间共享。 
+3. 文件私有：仅将文件内容加载进内存，但是修改不会同步到文件。
+4. 文件共享：对文件的修改会被同步，并且允许多个进程并发读写文件。底层会将不同进程的虚拟页面映射到同一个页缓存物理页面。
+
+页缓存实现了共享文件映射，即允许多个进程同时将一个文件映射到自己的地址空间，满足读写一致性。
+
+**原理是将 mmap 分配的虚拟页映射到 PageCache 的缓存页面**。
+
 
 ### 2.3 延迟加载：lazy-alloc 机制
+
+ArceOS 中有 lazy-alloc 机制，即分配的地址段不会立即建立页表，而是在访问页面并触发 page fault 时再分配页面并在页表中建立映射关系。
+
+Starry-next 在执行 mmap 时，内核不会立即将整个文件加载到内存，而是在需要的时候再进行加载。具体如下：
+
+- mmap 时仅在 AddressSpace 中分配了地址段，但没有建立页表。
+- 访问该内存时，因页表查找失败会触发 page fault，交由 starr-next 的 `handle_page_fault` 函数处理。
+- 在 `handle_page_fault` 函数中会执行 `lazy_map_file` 函数，尝试从文件中加载页面。
+- 每个进程都有一个 `struct ProcessVMAManager`，管理该进程的所有 mmap 地址段。`lazy_map_file` 函数会利用 `ProcessVMAManager` 来查询这个页面是否为 mmap 的文件映射，并获取相应的信息（`fd`，`offset` 等）。
+- 如果查询成功，就会通过 `PageCacheManager` 找到对应文件的 PageCache，并进行页表映射。
+
+在 `munmap` 时，会直接取消整个地址段的页表映射。
+
+从底层 ArceOS 基座的视角，上层 Starry-next 的 mmap 分配的地址段，**所有页面始终是非 Populate 且一直未使用的状态**，因为页表的 `map` 与 `unmap` 操作分别由 Starry-next 层处理，都没有经过 ArceOS 层。
 
 ### 2.4 页表反向映射
 
@@ -108,19 +139,34 @@ Starry-next 页面置换算法（目前的实现较为粗糙）：
 - 若 `clean_list` 空了，就只能从 `dirty_list` 中取。
 - 缺陷是仅对脏页敏感，而没有考虑最近是否访问了这个页面。从测例来看，页面置换算法的选择并不是很好。
 
-### 2.6 并发安全
+### 2.6 并发安全与内存安全
 
 page_cache 接管了所有上层的文件操作，包括文件相关的 `read, write` 以及 mmap 后的内存读写。所以只有在多个进程并发 `open` 文件的时候才会涉及 `axfs` 层的并发。
 
-page_cache 的锁细粒度较小，精细到每个页面。锁精细化的优点是提升并发性能，缺点是容易造成死锁和同步 bug。
+page_cache 的锁细粒度较小，精细到每个页面。锁精细化的优点是提升并发性能，缺点是容易造成死锁和其他各种同步 bug。这里主要利用了Rust 的 `LockGuard` 和 RAII 策略。具体可见 `PagePool::acquire_page`，`PageCache::_with_valid_page` 等函数。
+
+内存安全上，主要依赖 RAII 策略，保证页面在释放时会自动写回文件。
 
 ### 2.7 测试与性能分析
-- 文件 io 测试 `page_cache.c`：用于测试页缓存的性能提升。在 ext4 系统中，大规模局部性读取文件，性能将会从文件 io 级别提升至内存读写级别。
+
+测例：
+- 文件 io 测试 `page_cache.c`：用于测试页缓存的性能提升。
 
 ![性能比较](pic/io_speed.png)
 
 - 大规模并发 io 测试 `concurrent_io.c`：多个进程并发使用 `pwrite` 和 `pread` 系统调用写入和读取同一文件，验证读写一致性；
 - 大规模并发 mmap 测试 `concurrent_mmap.c`：多个进程同时 mmap 同一个文件到各自的地址空间，并发读写，验证读写一致性；
+
+时间性能分析：
+- 大规模**局部性**读取文件，时间性能将会从文件 io 级别提升至内存读写级别。
+- 单次写文件，页缓存并不会因内存拷贝造成额外的时间开销。因为即便是绕过页缓存的直接 IO，也需要将写入内容从用户空间拷贝到内核空间。
+- 单次读文件，会造成一次额外的内存拷贝开销。
+
+空间性能分析：
+- `struct Page` 占用 `64 Bytes`，它的存储形式为 `struct PagePool` 中的键值对 `(PageKey, Arc<RwLock<Page>>)`，合计占用 `80 Bytes`。此外，`PagePool::dirty_page_list`，`PagePool::dirty_page_list`，`PageCache::Pages` 中也有相关的指针，总计一个缓存页的维护信息占用 `104 Bytes`。
+- $104/4096=2.5\%$，是能够接受的额外内存开销。
+- 前文提到，在大量进程同时 mmap 同一个文件时，可能因页表反向映射机制产生较大内存开销。
+
 
 ### 2.8 局限性与展望
 
@@ -141,4 +187,12 @@ page_cache 的锁细粒度较小，精细到每个页面。锁精细化的优点
 
 ## 三、共享内存机制
 
+在 starry-next 层实现了共享内存，价值是帮助了一些同学通过全国大学生 OS 比赛的 iozone 测例，但该实现扩展性较低，因此没有合并到主线。
+
+目前正在编写基于 PageCache 和 mmap 的共享内存。
+
 ## 四、训练营收获
+
+入门了 Rust for OS 开发，一方面提升了对 OS 的理解，另一方面入门了 Rust 编程。
+
+未来会持续给 Starry-next 做贡献，并继续参与其他开源 Rust OS 社区。
